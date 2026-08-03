@@ -1,0 +1,6 @@
+../Core/Src/flash.c:54:13:flash_print_qspi_debug	24	static
+../Core/Src/flash.c:64:6:flash_is_ready	4	static
+../Core/Src/flash.c:78:19:flash_init	24	static
+../Core/Src/flash.c:260:19:flash_read	40	static
+../Core/Src/flash.c:321:19:flash_write	48	static
+../Core/Src/flash.c:449:19:flash_erase_4k	24	static

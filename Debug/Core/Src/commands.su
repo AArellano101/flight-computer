@@ -1,0 +1,16 @@
+../Drivers/CMSIS/Include/core_cm7.h:2156:34:__NVIC_SystemReset	4	static,ignoring_inline_asm
+../Core/Src/commands.c:38:6:command_process	16	static
+../Core/Src/commands.c:96:6:command_help	8	static
+../Core/Src/commands.c:132:6:command_status	40	static
+../Core/Src/commands.c:190:6:command_sensor_status	16	static
+../Core/Src/commands.c:233:6:command_reset	8	static
+../Core/Src/commands.c:253:6:print_rtc_datetime	56	static
+../Core/Src/commands.c:283:6:reset_cause_capture	4	static
+../Core/Src/commands.c:356:6:command_reset_cause	16	static
+../Core/Src/commands.c:438:6:baro_read	8	static
+../Core/Src/commands.c:443:13:command_parse_u32	24	static
+../Core/Src/commands.c:473:6:command_flash_read	56	static
+../Core/Src/commands.c:550:6:command_log_start	8	static
+../Core/Src/commands.c:561:6:command_log_stop	8	static
+../Core/Src/commands.c:572:6:command_log_clear	8	static
+../Core/Src/commands.c:597:6:command_log_dump	88	static

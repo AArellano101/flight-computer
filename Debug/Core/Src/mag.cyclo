@@ -1,0 +1,4 @@
+../Core/Src/mag.c:17:9:platform_write_iis2mdc	2
+../Core/Src/mag.c:30:9:platform_read_iis2mdc	2
+../Core/Src/mag.c:111:6:iis2mdctr_init	4
+../Core/Src/mag.c:176:9:iis2mdctr_read	2

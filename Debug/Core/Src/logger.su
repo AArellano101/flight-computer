@@ -1,0 +1,14 @@
+../Core/Src/logger.c:31:13:logger_record_is_erased	24	static
+../Core/Src/logger.c:49:17:logger_get_record_address	24	static
+../Core/Src/logger.c:66:19:logger_init	56	static
+../Core/Src/logger.c:159:19:logger_append	24	static
+../Core/Src/logger.c:252:10:logger_get_write_address	4	static
+../Core/Src/logger.c:257:10:logger_get_record_count	4	static
+../Core/Src/logger.c:262:6:logger_is_full	4	static
+../Core/Src/logger.c:267:19:logger_read_record	24	static
+../Core/Src/logger.c:316:19:logger_erase	8	static
+../Core/Src/logger.c:346:10:logger_get_capacity	4	static
+../Core/Src/logger.c:351:6:flash_logger_init	8	static
+../Core/Src/logger.c:377:19:logger_start	8	static
+../Core/Src/logger.c:419:19:logger_stop	8	static
+../Core/Src/logger.c:445:6:logger_is_active	4	static

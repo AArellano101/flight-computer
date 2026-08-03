@@ -1,0 +1,4 @@
+../Core/Src/imu.c:18:9:platform_write	48	static
+../Core/Src/imu.c:28:9:platform_read	48	static
+../Core/Src/imu.c:38:6:lsm6dso32x_init	16	static
+../Core/Src/imu.c:77:6:lsm6dso32x_read_data	32	static

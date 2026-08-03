@@ -1,0 +1,4 @@
+../Core/Src/imu.c:18:9:platform_write	2
+../Core/Src/imu.c:28:9:platform_read	2
+../Core/Src/imu.c:38:6:lsm6dso32x_init	3
+../Core/Src/imu.c:77:6:lsm6dso32x_read_data	3
