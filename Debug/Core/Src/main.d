@@ -35,7 +35,9 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h \
  ../Core/Inc/commands.h ../Core/Inc/imu.h ../Core/Inc/lsm6dso32x_reg.h \
  ../Core/Inc/ms5611.h ../Core/Inc/mag.h ../Core/Inc/iis2mdc_reg.h \
- ../Core/Inc/flash.h ../Core/Inc/logger.h
+ ../Core/Inc/flash.h ../Core/Inc/logger.h ../Core/Inc/sensors.h \
+ ../Core/Inc/ground_calibration.h ../Core/Inc/imu.h ../Core/Inc/ms5611.h \
+ ../Core/Inc/flight_app.h
 ../Core/Inc/main.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h:
 ../Core/Inc/stm32h7xx_hal_conf.h:
@@ -79,3 +81,8 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/iis2mdc_reg.h:
 ../Core/Inc/flash.h:
 ../Core/Inc/logger.h:
+../Core/Inc/sensors.h:
+../Core/Inc/ground_calibration.h:
+../Core/Inc/imu.h:
+../Core/Inc/ms5611.h:
+../Core/Inc/flight_app.h:

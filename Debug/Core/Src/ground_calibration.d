@@ -1,5 +1,6 @@
-Core/Src/commands.o: ../Core/Src/commands.c ../Core/Inc/commands.h \
- ../Core/Inc/main.h ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h \
+Core/Src/ground_calibration.o: ../Core/Src/ground_calibration.c \
+ ../Core/Inc/ground_calibration.h ../Core/Inc/imu.h \
+ ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h \
  ../Core/Inc/stm32h7xx_hal_conf.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_rcc.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_def.h \
@@ -33,12 +34,9 @@ Core/Src/commands.o: ../Core/Src/commands.c ../Core/Inc/commands.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_rtc_ex.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h \
  ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h \
- ../Core/Inc/sensors.h ../Core/Inc/imu.h ../Core/Inc/lsm6dso32x_reg.h \
- ../Core/Inc/ms5611.h ../Core/Inc/flash.h ../Core/Inc/logger.h \
- ../Core/Inc/ground_calibration.h ../Core/Inc/imu.h ../Core/Inc/ms5611.h \
- ../Core/Inc/flight_app.h
-../Core/Inc/commands.h:
-../Core/Inc/main.h:
+ ../Core/Inc/lsm6dso32x_reg.h ../Core/Inc/ms5611.h
+../Core/Inc/ground_calibration.h:
+../Core/Inc/imu.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal.h:
 ../Core/Inc/stm32h7xx_hal_conf.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_rcc.h:
@@ -73,13 +71,5 @@ Core/Src/commands.o: ../Core/Src/commands.c ../Core/Inc/commands.h \
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_rtc_ex.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart.h:
 ../Drivers/STM32H7xx_HAL_Driver/Inc/stm32h7xx_hal_uart_ex.h:
-../Core/Inc/sensors.h:
-../Core/Inc/imu.h:
 ../Core/Inc/lsm6dso32x_reg.h:
 ../Core/Inc/ms5611.h:
-../Core/Inc/flash.h:
-../Core/Inc/logger.h:
-../Core/Inc/ground_calibration.h:
-../Core/Inc/imu.h:
-../Core/Inc/ms5611.h:
-../Core/Inc/flight_app.h:

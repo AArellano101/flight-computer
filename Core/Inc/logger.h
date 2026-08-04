@@ -10,21 +10,30 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#define LOGGER_FORMAT_VERSION              (2U)
+
+#define FLIGHT_LOG_VALID_IMU               (1UL << 0)
+#define FLIGHT_LOG_VALID_BAROMETER         (1UL << 1)
+#define FLIGHT_LOG_VALID_ALTITUDE_AGL      (1UL << 2)
+#define FLIGHT_LOG_GYRO_BIAS_CORRECTED     (1UL << 3)
+
 typedef struct
 {
-    uint32_t timestamp_ms;
+    uint32_t timestamp_ms;             /* paired IMU sample time */
+    uint32_t barometer_timestamp_ms;   /* source time for baro/AGL fields */
+    uint32_t validity_flags;
 
-    float acceleration_x;
-    float acceleration_y;
-    float acceleration_z;
+    float acceleration_x;  /* mg, vehicle body frame */
+    float acceleration_y;  /* mg, vehicle body frame */
+    float acceleration_z;  /* mg, vehicle body frame */
 
-    float angular_rate_x;
-    float angular_rate_y;
-    float angular_rate_z;
+    float angular_rate_x;  /* calibrated dps */
+    float angular_rate_y;  /* calibrated dps */
+    float angular_rate_z;  /* calibrated dps */
 
-    float pressure_pa;
+    float pressure_pa;     /* absolute compensated pressure */
     float temperature_c;
-    float altitude_m;
+    float altitude_m;      /* AGL; NAN until ground calibration is valid */
 } FlightLogRecord_t;
 
 HAL_StatusTypeDef logger_init(void);
@@ -46,6 +55,8 @@ bool logger_is_full(void);
 HAL_StatusTypeDef logger_erase(void);
 
 uint32_t logger_get_capacity(void);
+
+uint16_t logger_get_format_version(void);
 
 void flash_logger_init(void);
 

@@ -1,5 +1,6 @@
 "./Core/Src/commands.o"
 "./Core/Src/flash.o"
+"./Core/Src/ground_calibration.o"
 "./Core/Src/iis2mdc.o"
 "./Core/Src/iis2mdc_reg.o"
 "./Core/Src/imu.o"

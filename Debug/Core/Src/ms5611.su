@@ -1,6 +1,11 @@
-../Core/Src/ms5611.c:19:13:MS5611_SendCommand	24	static
-../Core/Src/ms5611.c:25:17:MS5611_ReadADC	40	static
-../Core/Src/ms5611.c:34:17:MS5611_ReadPROM	40	static
-../Core/Src/ms5611.c:44:13:MS5611_SetupConstants	16	static
-../Core/Src/ms5611.c:62:6:MS5611_Init	24	static
-../Core/Src/ms5611.c:78:6:MS5611_Measure	72	static
+../Core/Src/ms5611.c:32:26:MS5611_SendCommand	24	static
+../Core/Src/ms5611.c:39:26:MS5611_ReadADC	40	static
+../Core/Src/ms5611.c:57:26:MS5611_ReadPROM	48	static
+../Core/Src/ms5611.c:76:16:MS5611_CalculateCRC4	24	static
+../Core/Src/ms5611.c:107:13:MS5611_PROMIsValid	24	static
+../Core/Src/ms5611.c:120:13:MS5611_ADCIsValid	16	static
+../Core/Src/ms5611.c:127:13:MS5611_Compensate	456	static
+../Core/Src/ms5611.c:179:13:MS5611_ConversionReady	8	static
+../Core/Src/ms5611.c:185:13:MS5611_DiscardPair	4	static
+../Core/Src/ms5611.c:191:19:MS5611_Init	24	static
+../Core/Src/ms5611.c:228:21:MS5611_Poll	48	static

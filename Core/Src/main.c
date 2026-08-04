@@ -28,7 +28,12 @@
 #include "mag.h"
 #include "flash.h"
 #include "logger.h"
+#include "sensors.h"
+#include "ground_calibration.h"
+#include "flight_app.h"
 #include <stdbool.h>
+#include <math.h>
+#include <string.h>
 
 /* USER CODE END Includes */
 
@@ -64,16 +69,41 @@ UART_HandleTypeDef huart2;
 
 #define COMMAND_BUFFER_SIZE 64U
 #define RTC_INIT_MARKER  0xA5A55A5AU // Arbitrary value for a flag
+#define RTC_FLIGHT_LOCK_MARKER 0x464C544CUL /* "FLTL" */
 
 static uint8_t uart_rx_byte;
 static char command_buffer[COMMAND_BUFFER_SIZE];
 static volatile uint32_t command_index = 0U;
 static volatile uint8_t command_ready = 0U;
 
-#define IMU_PRINT_INTERVAL_MS 100U
+#define IMU_POLL_INTERVAL_MS 10U
+#define BAROMETER_POLL_INTERVAL_MS 2U
+#define IMU_PAIR_MAX_SKEW_MS 25U
+#define BAROMETER_LOG_MAX_AGE_MS 100U
+#define SENSOR_REINIT_INTERVAL_MS 1000U
+#define IMU_NO_DATA_TIMEOUT_MS 500U
+#define BAROMETER_NO_DATA_TIMEOUT_MS 500U
 
-float temperature_c = 0.0f;
-float pressure_hpa = 0.0f;
+static ImuSample_t latest_imu_sample;
+static ImuSample_t pending_imu_pair;
+static MS5611_Sample_t latest_baro_sample;
+static float latest_altitude_agl_m = NAN;
+static bool latest_imu_sample_valid = false;
+static bool latest_baro_sample_valid = false;
+static bool latest_altitude_valid = false;
+static bool imu_available = false;
+static bool barometer_available = false;
+static uint8_t pending_imu_fresh_mask = 0U;
+static uint32_t pending_accel_timestamp_ms = 0U;
+static uint32_t pending_gyro_timestamp_ms = 0U;
+static uint32_t last_imu_pair_timestamp_ms = 0U;
+static bool have_last_imu_pair = false;
+static uint32_t last_baro_sample_timestamp_ms = 0U;
+static bool have_last_baro_sample = false;
+
+static volatile uint8_t calibration_restart_requested = 0U;
+static volatile uint8_t calibration_abort_requested = 0U;
+static bool ground_mode_confirmed = false;
 
 #define FLASH_ENABLE_SELF_TEST 0U
 
@@ -162,7 +192,13 @@ int main(void)
   setvbuf(stdout, NULL, _IONBF, 0);
 
   // Accelerometer + Gyroscope
-  lsm6dso32x_init();
+  imu_available = (lsm6dso32x_init() == HAL_OK);
+  sensor_health_set_initialized(SENSOR_ID_IMU, imu_available);
+
+  if (!imu_available)
+  {
+    printf("[MAIN] IMU initialization failed.\r\n");
+  }
 
   // Magnetometer
 //  printf("\r\nInitializing magnetometer\r\n");
@@ -170,12 +206,35 @@ int main(void)
 //  printf("Returned from magnetometer initialization\r\n");
 
   // Barometer
-  MS5611_Init(&hi2c2, 0);
+  barometer_available = (MS5611_Init(&hi2c2) == HAL_OK);
+  sensor_health_set_initialized(SENSOR_ID_BAROMETER, barometer_available);
+
+  if (!barometer_available)
+  {
+    printf("[MAIN] Barometer initialization or PROM CRC check failed.\r\n");
+  }
+
+  /* Magnetometer is intentionally optional until its application path is enabled. */
+  sensor_health_set_initialized(SENSOR_ID_MAGNETOMETER, false);
 
   // Flash
   flash_logger_init();
 
-  uint32_t last_sensor_tick = HAL_GetTick();
+  uint32_t last_imu_poll_tick = HAL_GetTick();
+  uint32_t last_baro_poll_tick = HAL_GetTick();
+  uint32_t last_imu_activity_tick = last_imu_poll_tick;
+  uint32_t last_baro_activity_tick = last_baro_poll_tick;
+  uint32_t last_imu_reinit_attempt_tick = last_imu_poll_tick;
+  uint32_t last_baro_reinit_attempt_tick = last_baro_poll_tick;
+
+  /*
+   * Ground confirmation is deliberately boot-local and single-use. Never
+   * infer that the vehicle is still on the ground from state saved before a
+   * reset; an in-flight reset must come up calibration-locked.
+   */
+  ground_mode_confirmed = false;
+  printf("[CAL] Recalibration inhibited after reset.\r\n");
+  printf("[CAL] When safely stationary on the ground, use 'ground_confirm'.\r\n");
 
   printf("\r\nMini Flight Computer Console\r\n");
   printf("Type 'help' for available commands.\r\n");
@@ -189,6 +248,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+      uint32_t now_ms = HAL_GetTick();
+      bool fresh_paired_imu = false;
+      bool required_sensor_recovered = false;
+      ImuSample_t imu_sample_for_log = {0};
+
       if (command_ready != 0U)
       {
           command_process(command_buffer);
@@ -196,54 +260,469 @@ int main(void)
           printf("> ");
       }
 
-
-      if ((HAL_GetTick() - last_sensor_tick) >= 100U)
+      if (calibration_abort_requested != 0U)
       {
-		  FlightLogRecord_t record = {0};
+          calibration_abort_requested = 0U;
+          ground_calibration_abort();
+      }
 
-		  last_sensor_tick += 10U;
+      if (calibration_restart_requested != 0U)
+      {
+          calibration_restart_requested = 0U;
 
-		  /*
-		   * Read your sensors here.
-		   */
-		  lsm6dso32x_read_data();
-		  baro_read();
+          if (!ground_mode_confirmed)
+          {
+              printf("[CAL] Restart rejected: ground mode is not confirmed.\r\n");
+          }
+          else if (logger_is_active())
+          {
+              printf("[CAL] Stop logging before restarting calibration.\r\n");
+          }
+          else if (!imu_available)
+          {
+              ground_calibration_fault(GROUND_CALIBRATION_FAILURE_IMU_ERROR);
+          }
+          else if (!barometer_available)
+          {
+              ground_calibration_fault(GROUND_CALIBRATION_FAILURE_BARO_ERROR);
+          }
+          else
+          {
+              latest_altitude_valid = false;
+              latest_altitude_agl_m = NAN;
+              ground_calibration_restart(now_ms);
+              printf("[CAL] Ground calibration restarted. Keep vehicle still.\r\n");
+          }
+      }
 
-		  /*
-		   * Build one logger record from the latest measurements.
-		   * Replace these variable names with your actual variables.
-		   */
-		  record.timestamp_ms = HAL_GetTick();
+      if (!imu_available &&
+          ((now_ms - last_imu_reinit_attempt_tick) >=
+           SENSOR_REINIT_INTERVAL_MS))
+      {
+          last_imu_reinit_attempt_tick = now_ms;
 
-		  record.acceleration_x = acceleration_mg[0];
-		  record.acceleration_y = acceleration_mg[1];
-		  record.acceleration_z = acceleration_mg[2];
+          if (lsm6dso32x_init() == HAL_OK)
+          {
+              imu_available = true;
+              latest_imu_sample_valid = false;
+              pending_imu_fresh_mask = 0U;
+              pending_accel_timestamp_ms = 0U;
+              pending_gyro_timestamp_ms = 0U;
+              have_last_imu_pair = false;
+              sensor_health_set_initialized(SENSOR_ID_IMU, true);
+              last_imu_activity_tick = HAL_GetTick();
+              last_imu_poll_tick = last_imu_activity_tick;
+              required_sensor_recovered = true;
+              printf("[MAIN] IMU reinitialized.\r\n");
+          }
+      }
 
-		  record.angular_rate_x = angular_rate_dps[0];
-		  record.angular_rate_y = angular_rate_dps[1];
-		  record.angular_rate_z = angular_rate_dps[2];
+      if (!barometer_available &&
+          ((now_ms - last_baro_reinit_attempt_tick) >=
+           SENSOR_REINIT_INTERVAL_MS))
+      {
+          last_baro_reinit_attempt_tick = now_ms;
 
-		  record.pressure_pa = pressure_hpa;
-		  record.temperature_c = temperature_c;
-		  record.altitude_m = 0;
+          if (MS5611_Init(&hi2c2) == HAL_OK)
+          {
+              barometer_available = true;
+              latest_baro_sample_valid = false;
+              latest_altitude_valid = false;
+              latest_altitude_agl_m = NAN;
+              sensor_health_set_initialized(SENSOR_ID_BAROMETER, true);
+              have_last_baro_sample = false;
+              last_baro_activity_tick = HAL_GetTick();
+              last_baro_poll_tick = last_baro_activity_tick;
+              required_sensor_recovered = true;
+              printf("[MAIN] Barometer reinitialized.\r\n");
+          }
+      }
 
-		  /*
-		   * Store the record only after the log_start command has
-		   * made the logger active.
-		   */
-		  if (logger_available && logger_is_active())
-		  {
-			  if (logger_append(&record) != HAL_OK)
-			  {
-				  printf(
-					  "[MAIN] Failed to store log record. "
-					  "Logging will be stopped.\r\n"
-				  );
+      now_ms = HAL_GetTick();
 
-				  (void)logger_stop();
-			  }
-		  }
-	  }
+      if (required_sensor_recovered &&
+          imu_available &&
+          barometer_available &&
+          ground_mode_confirmed &&
+          !logger_is_active() &&
+          (ground_calibration_get_state() == GROUND_CALIBRATION_FAULT) &&
+          ((ground_calibration_get_failure() ==
+            GROUND_CALIBRATION_FAILURE_IMU_ERROR) ||
+           (ground_calibration_get_failure() ==
+            GROUND_CALIBRATION_FAILURE_BARO_ERROR)))
+      {
+          ground_calibration_restart(now_ms);
+          printf("[CAL] Required sensors recovered; calibration restarted.\r\n");
+      }
+
+      ground_calibration_update(now_ms);
+
+      if (imu_available &&
+          ((now_ms - last_imu_poll_tick) >= IMU_POLL_INTERVAL_MS))
+      {
+          ImuSample_t sensor_sample;
+          ImuSample_t sample;
+          ImuPollStatus_t poll_status;
+
+          /* Skip missed periods instead of issuing catch-up bursts. */
+          last_imu_poll_tick = now_ms;
+          poll_status = lsm6dso32x_poll(&sensor_sample);
+
+          if (poll_status == IMU_POLL_NEW_DATA)
+          {
+              /* Calibration, health, commands, and logs all use body axes. */
+              imu_transform_sensor_to_body(&sensor_sample, &sample);
+              latest_imu_sample = sample;
+              latest_imu_sample_valid = true;
+
+              /*
+               * Accel and gyro DRDY bits are not required to assert in the
+               * same poll. The driver preserves the latest counterpart, so
+               * publish only after both have advanced within one nominal
+               * 52-Hz sample period.
+               */
+              pending_imu_pair = sample;
+
+              if ((sample.fresh_mask & IMU_SAMPLE_ACCEL_FRESH) != 0U)
+              {
+                  pending_accel_timestamp_ms = sample.timestamp_ms;
+                  pending_imu_fresh_mask |= IMU_SAMPLE_ACCEL_FRESH;
+              }
+
+              if ((sample.fresh_mask & IMU_SAMPLE_GYRO_FRESH) != 0U)
+              {
+                  pending_gyro_timestamp_ms = sample.timestamp_ms;
+                  pending_imu_fresh_mask |= IMU_SAMPLE_GYRO_FRESH;
+              }
+
+              if ((pending_imu_fresh_mask &
+                   (IMU_SAMPLE_ACCEL_FRESH | IMU_SAMPLE_GYRO_FRESH)) ==
+                  (IMU_SAMPLE_ACCEL_FRESH | IMU_SAMPLE_GYRO_FRESH))
+              {
+                  int32_t signed_skew =
+                      (int32_t)(pending_accel_timestamp_ms -
+                                pending_gyro_timestamp_ms);
+                  uint32_t pair_skew_ms = (signed_skew >= 0)
+                                              ? (uint32_t)signed_skew
+                                              : (pending_gyro_timestamp_ms -
+                                                 pending_accel_timestamp_ms);
+
+                  if (pair_skew_ms > IMU_PAIR_MAX_SKEW_MS)
+                  {
+                      GroundCalibrationState_t calibration_state =
+                          ground_calibration_get_state();
+
+                      sensor_health_record_failure(SENSOR_ID_IMU);
+
+                      if (calibration_state ==
+                          GROUND_CALIBRATION_CALIBRATING)
+                      {
+                          ground_calibration_process_imu(NULL);
+                      }
+
+                      /* Retain only the newer half for the next pairing. */
+                      if (signed_skew > 0)
+                      {
+                          pending_imu_fresh_mask = IMU_SAMPLE_ACCEL_FRESH;
+                          pending_gyro_timestamp_ms = 0U;
+                      }
+                      else
+                      {
+                          pending_imu_fresh_mask = IMU_SAMPLE_GYRO_FRESH;
+                          pending_accel_timestamp_ms = 0U;
+                      }
+                  }
+                  else
+                  {
+                      bool cadence_valid =
+                          !have_last_imu_pair ||
+                          ((pending_imu_pair.timestamp_ms -
+                            last_imu_pair_timestamp_ms) <=
+                           GROUND_CALIBRATION_MAX_IMU_GAP_MS);
+
+                      pending_imu_pair.fresh_mask =
+                          IMU_SAMPLE_ACCEL_FRESH | IMU_SAMPLE_GYRO_FRESH;
+                      pending_imu_pair.timestamp_ms =
+                          (signed_skew >= 0)
+                              ? pending_accel_timestamp_ms
+                              : pending_gyro_timestamp_ms;
+
+                      if (cadence_valid)
+                      {
+                          sensor_health_record_success(
+                              SENSOR_ID_IMU,
+                              pending_imu_pair.timestamp_ms);
+                          last_imu_activity_tick =
+                              pending_imu_pair.timestamp_ms;
+                      }
+                      else
+                      {
+                          sensor_health_record_failure(SENSOR_ID_IMU);
+
+                          if (ground_calibration_get_state() ==
+                              GROUND_CALIBRATION_CALIBRATING)
+                          {
+                              ground_calibration_process_imu(NULL);
+                          }
+                      }
+
+                      last_imu_pair_timestamp_ms =
+                          pending_imu_pair.timestamp_ms;
+                      have_last_imu_pair = true;
+                      ground_calibration_process_imu(&pending_imu_pair);
+                      imu_sample_for_log = pending_imu_pair;
+                      fresh_paired_imu = true;
+                      pending_imu_fresh_mask = 0U;
+                      pending_accel_timestamp_ms = 0U;
+                      pending_gyro_timestamp_ms = 0U;
+                  }
+              }
+          }
+          else if (poll_status == IMU_POLL_ERROR)
+          {
+              SensorHealth_t health;
+              GroundCalibrationState_t calibration_state =
+                  ground_calibration_get_state();
+
+              sensor_health_record_failure(SENSOR_ID_IMU);
+              pending_imu_fresh_mask = 0U;
+              pending_accel_timestamp_ms = 0U;
+              pending_gyro_timestamp_ms = 0U;
+              health = sensor_health_get(SENSOR_ID_IMU);
+
+              if (calibration_state == GROUND_CALIBRATION_CALIBRATING)
+              {
+                  /* A missing frame invalidates the contiguous sample window. */
+                  ground_calibration_process_imu(NULL);
+              }
+
+              if (health.consecutive_failures >= 3U)
+              {
+                  imu_available = false;
+                  latest_imu_sample_valid = false;
+                  have_last_imu_pair = false;
+                  sensor_health_set_initialized(SENSOR_ID_IMU, false);
+                  last_imu_reinit_attempt_tick = HAL_GetTick();
+                  printf("[MAIN] IMU offline; periodic reinitialization enabled.\r\n");
+
+                  if ((calibration_state == GROUND_CALIBRATION_WARMUP) ||
+                      (calibration_state == GROUND_CALIBRATION_CALIBRATING) ||
+                      (ground_mode_confirmed &&
+                       (calibration_state == GROUND_CALIBRATION_READY)))
+                  {
+                      ground_calibration_fault(
+                          GROUND_CALIBRATION_FAILURE_IMU_ERROR);
+                  }
+              }
+          }
+      }
+
+      if (barometer_available &&
+          ((now_ms - last_baro_poll_tick) >= BAROMETER_POLL_INTERVAL_MS))
+      {
+          MS5611_Sample_t sample;
+          MS5611_PollStatus_t poll_status;
+
+          last_baro_poll_tick = now_ms;
+          poll_status = MS5611_Poll(&hi2c2, &sample);
+
+          if (poll_status == MS5611_POLL_NEW_DATA)
+          {
+              bool cadence_valid =
+                  !have_last_baro_sample ||
+                  ((sample.timestamp_ms - last_baro_sample_timestamp_ms) <=
+                   GROUND_CALIBRATION_MAX_BARO_GAP_MS);
+
+              latest_baro_sample = sample;
+              latest_baro_sample_valid = true;
+
+              if (cadence_valid)
+              {
+                  sensor_health_record_success(
+                      SENSOR_ID_BAROMETER,
+                      sample.timestamp_ms);
+                  last_baro_activity_tick = sample.timestamp_ms;
+              }
+              else
+              {
+                  sensor_health_record_failure(SENSOR_ID_BAROMETER);
+              }
+
+              last_baro_sample_timestamp_ms = sample.timestamp_ms;
+              have_last_baro_sample = true;
+              ground_calibration_process_baro(&sample);
+
+              latest_altitude_valid = ground_calibration_altitude_agl_m(
+                  sample.pressure_pa,
+                  &latest_altitude_agl_m);
+
+              if (!latest_altitude_valid)
+              {
+                  latest_altitude_agl_m = NAN;
+              }
+          }
+          else if (poll_status == MS5611_POLL_ERROR)
+          {
+              SensorHealth_t health;
+              GroundCalibrationState_t calibration_state =
+                  ground_calibration_get_state();
+
+              sensor_health_record_failure(SENSOR_ID_BAROMETER);
+              latest_baro_sample_valid = false;
+              latest_altitude_valid = false;
+              latest_altitude_agl_m = NAN;
+              health = sensor_health_get(SENSOR_ID_BAROMETER);
+
+              if (calibration_state == GROUND_CALIBRATION_CALIBRATING)
+              {
+                  ground_calibration_process_baro(NULL);
+              }
+
+              if (health.consecutive_failures >= 3U)
+              {
+                  barometer_available = false;
+                  have_last_baro_sample = false;
+                  sensor_health_set_initialized(SENSOR_ID_BAROMETER, false);
+                  last_baro_reinit_attempt_tick = HAL_GetTick();
+                  printf("[MAIN] Barometer offline; periodic reinitialization enabled.\r\n");
+
+                  if ((calibration_state == GROUND_CALIBRATION_WARMUP) ||
+                      (calibration_state == GROUND_CALIBRATION_CALIBRATING) ||
+                      (ground_mode_confirmed &&
+                       (calibration_state == GROUND_CALIBRATION_READY)))
+                  {
+                      ground_calibration_fault(
+                          GROUND_CALIBRATION_FAILURE_BARO_ERROR);
+                  }
+              }
+          }
+      }
+
+      if (imu_available &&
+          ((HAL_GetTick() - last_imu_activity_tick) >
+           IMU_NO_DATA_TIMEOUT_MS))
+      {
+          GroundCalibrationState_t calibration_state =
+              ground_calibration_get_state();
+
+          imu_available = false;
+          latest_imu_sample_valid = false;
+          pending_imu_fresh_mask = 0U;
+          pending_accel_timestamp_ms = 0U;
+          pending_gyro_timestamp_ms = 0U;
+          have_last_imu_pair = false;
+          sensor_health_set_initialized(SENSOR_ID_IMU, false);
+          last_imu_reinit_attempt_tick = HAL_GetTick();
+          printf("[MAIN] IMU data timeout; periodic reinitialization enabled.\r\n");
+
+          if ((calibration_state == GROUND_CALIBRATION_WARMUP) ||
+              (calibration_state == GROUND_CALIBRATION_CALIBRATING) ||
+              (ground_mode_confirmed &&
+               (calibration_state == GROUND_CALIBRATION_READY)))
+          {
+              ground_calibration_fault(GROUND_CALIBRATION_FAILURE_IMU_ERROR);
+          }
+      }
+
+      if (barometer_available &&
+          ((HAL_GetTick() - last_baro_activity_tick) >
+           BAROMETER_NO_DATA_TIMEOUT_MS))
+      {
+          GroundCalibrationState_t calibration_state =
+              ground_calibration_get_state();
+
+          barometer_available = false;
+          have_last_baro_sample = false;
+          latest_baro_sample_valid = false;
+          latest_altitude_valid = false;
+          latest_altitude_agl_m = NAN;
+          sensor_health_set_initialized(SENSOR_ID_BAROMETER, false);
+          last_baro_reinit_attempt_tick = HAL_GetTick();
+          printf("[MAIN] Barometer data timeout; periodic reinitialization enabled.\r\n");
+
+          if ((calibration_state == GROUND_CALIBRATION_WARMUP) ||
+              (calibration_state == GROUND_CALIBRATION_CALIBRATING) ||
+              (ground_mode_confirmed &&
+               (calibration_state == GROUND_CALIBRATION_READY)))
+          {
+              ground_calibration_fault(GROUND_CALIBRATION_FAILURE_BARO_ERROR);
+          }
+      }
+
+      if (ground_mode_confirmed && ground_calibration_is_ready())
+      {
+          /* A confirmation authorizes one completed calibration only. */
+          flight_lock_ground_calibration();
+          printf("[CAL] Calibration READY; ground confirmation consumed.\r\n");
+      }
+
+      /* Calibration can complete on an IMU frame between barometer frames. */
+      if (!latest_altitude_valid &&
+          latest_baro_sample_valid &&
+          ground_calibration_is_ready())
+      {
+          latest_altitude_valid = ground_calibration_altitude_agl_m(
+              latest_baro_sample.pressure_pa,
+              &latest_altitude_agl_m);
+      }
+
+      /* Do not carry an old pressure/AGL value into a newer IMU log frame. */
+      if (latest_baro_sample_valid &&
+          ((HAL_GetTick() - latest_baro_sample.timestamp_ms) >
+           BAROMETER_LOG_MAX_AGE_MS))
+      {
+          latest_baro_sample_valid = false;
+          latest_altitude_valid = false;
+          latest_altitude_agl_m = NAN;
+      }
+
+      /* Check required sources before appending a record from this frame. */
+      if (logger_is_active() &&
+          (!imu_is_healthy() ||
+           !barometer_is_healthy() ||
+           !latest_baro_sample_valid ||
+           !latest_altitude_valid))
+      {
+          printf("[MAIN] Required sensor data became invalid; logging stopped.\r\n");
+          (void)logger_stop();
+      }
+
+      if (fresh_paired_imu && logger_available && logger_is_active())
+      {
+          FlightLogRecord_t record = {0};
+          float corrected_gyro_dps[3];
+
+          ground_calibration_correct_gyro(
+              imu_sample_for_log.angular_rate_dps,
+              corrected_gyro_dps);
+
+          record.timestamp_ms = imu_sample_for_log.timestamp_ms;
+          record.barometer_timestamp_ms = latest_baro_sample.timestamp_ms;
+          record.validity_flags = FLIGHT_LOG_VALID_IMU |
+                                  FLIGHT_LOG_VALID_BAROMETER |
+                                  FLIGHT_LOG_VALID_ALTITUDE_AGL |
+                                  FLIGHT_LOG_GYRO_BIAS_CORRECTED;
+          record.acceleration_x = imu_sample_for_log.acceleration_mg[0];
+          record.acceleration_y = imu_sample_for_log.acceleration_mg[1];
+          record.acceleration_z = imu_sample_for_log.acceleration_mg[2];
+          record.angular_rate_x = corrected_gyro_dps[0];
+          record.angular_rate_y = corrected_gyro_dps[1];
+          record.angular_rate_z = corrected_gyro_dps[2];
+
+          record.pressure_pa = latest_baro_sample.pressure_pa;
+          record.temperature_c = latest_baro_sample.temperature_c;
+          record.altitude_m = latest_altitude_agl_m;
+
+          if (logger_append(&record) != HAL_OK)
+          {
+              printf(
+                  "[MAIN] Failed to store log record. "
+                  "Logging will be stopped.\r\n"
+              );
+
+              (void)logger_stop();
+          }
+      }
 
     /* USER CODE END WHILE */
 
@@ -724,6 +1203,83 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+bool flight_request_ground_calibration_restart(void)
+{
+    if (!ground_mode_confirmed)
+    {
+        return false;
+    }
+
+    calibration_restart_requested = 1U;
+    return true;
+}
+
+void flight_request_ground_calibration_abort(void)
+{
+    calibration_abort_requested = 1U;
+}
+
+void flight_confirm_ground_mode(void)
+{
+    ground_mode_confirmed = true;
+    calibration_restart_requested = 1U;
+}
+
+void flight_lock_ground_calibration(void)
+{
+    /*
+     * The backup-domain latch survives MCU resets. Future arming paths must
+     * call this boundary before enabling flight outputs, even if logging is
+     * not used as the arming action.
+    */
+    HAL_RTCEx_BKUPWrite(&hrtc, RTC_BKP_DR1, RTC_FLIGHT_LOCK_MARKER);
+    ground_mode_confirmed = false;
+
+    if ((ground_calibration_get_state() == GROUND_CALIBRATION_WARMUP) ||
+        (ground_calibration_get_state() == GROUND_CALIBRATION_CALIBRATING))
+    {
+        ground_calibration_abort();
+    }
+}
+
+bool flight_is_ground_mode_confirmed(void)
+{
+    return ground_mode_confirmed;
+}
+
+bool flight_get_latest_imu_sample(ImuSample_t *sample)
+{
+    if ((sample == NULL) || !latest_imu_sample_valid)
+    {
+        return false;
+    }
+
+    *sample = latest_imu_sample;
+    return true;
+}
+
+bool flight_get_latest_baro_sample(MS5611_Sample_t *sample)
+{
+    if ((sample == NULL) || !latest_baro_sample_valid)
+    {
+        return false;
+    }
+
+    *sample = latest_baro_sample;
+    return true;
+}
+
+bool flight_get_latest_altitude_agl_m(float *altitude_m)
+{
+    if ((altitude_m == NULL) || !latest_altitude_valid)
+    {
+        return false;
+    }
+
+    *altitude_m = latest_altitude_agl_m;
+    return true;
+}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {

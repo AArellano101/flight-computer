@@ -7,6 +7,13 @@
 #define LOGGER_REGION_END           EXT_FLASH_LOG_END_ADDRESS
 #define LOGGER_SECTOR_SIZE          EXT_FLASH_SECTOR_SIZE_4K
 
+#define LOGGER_FORMAT_MAGIC         (0x32474F4CUL) /* "LOG2" */
+#define LOGGER_FORMAT_SEMANTICS     (FLIGHT_LOG_VALID_IMU | \
+                                     FLIGHT_LOG_VALID_BAROMETER | \
+                                     FLIGHT_LOG_VALID_ALTITUDE_AGL | \
+                                     FLIGHT_LOG_GYRO_BIAS_CORRECTED)
+#define LOGGER_METADATA_CHECK_XOR   (0xA5C35A3CUL)
+
 #define LOGGER_RECORD_SIZE          ((uint32_t)sizeof(FlightLogRecord_t))
 
 #define LOGGER_RECORDS_PER_SECTOR   \
@@ -18,6 +25,16 @@
 #define LOGGER_MAX_RECORDS          \
     (LOGGER_RECORDS_PER_SECTOR * LOGGER_SECTOR_COUNT)
 
+typedef struct
+{
+    uint32_t magic;
+    uint16_t format_version;
+    uint16_t header_size;
+    uint32_t record_size;
+    uint32_t semantics;
+    uint32_t check;
+} LoggerMetadata_t;
+
 extern bool flash_available;
 extern bool logger_available;
 
@@ -28,13 +45,12 @@ static bool logger_initialized = false;
 static bool logger_full = false;
 static bool logger_active = false;
 
-static bool logger_record_is_erased(
-    const FlightLogRecord_t *record)
+static bool logger_bytes_are_erased(const void *data, uint32_t size)
 {
-    const uint8_t *bytes = (const uint8_t *)record;
+    const uint8_t *bytes = (const uint8_t *)data;
 
     for (uint32_t i = 0U;
-         i < sizeof(FlightLogRecord_t);
+         i < size;
          i++)
     {
         if (bytes[i] != 0xFFU)
@@ -44,6 +60,52 @@ static bool logger_record_is_erased(
     }
 
     return true;
+}
+
+static uint32_t logger_metadata_check(const LoggerMetadata_t *metadata)
+{
+    return metadata->magic ^
+           (((uint32_t)metadata->format_version << 16U) |
+            (uint32_t)metadata->header_size) ^
+           metadata->record_size ^
+           metadata->semantics ^
+           LOGGER_METADATA_CHECK_XOR;
+}
+
+static LoggerMetadata_t logger_expected_metadata(void)
+{
+    LoggerMetadata_t metadata = {
+        .magic = LOGGER_FORMAT_MAGIC,
+        .format_version = LOGGER_FORMAT_VERSION,
+        .header_size = (uint16_t)sizeof(LoggerMetadata_t),
+        .record_size = sizeof(FlightLogRecord_t),
+        .semantics = LOGGER_FORMAT_SEMANTICS,
+        .check = 0U
+    };
+
+    metadata.check = logger_metadata_check(&metadata);
+    return metadata;
+}
+
+static bool logger_metadata_is_valid(const LoggerMetadata_t *metadata)
+{
+    LoggerMetadata_t expected = logger_expected_metadata();
+
+    return (metadata->magic == expected.magic) &&
+           (metadata->format_version == expected.format_version) &&
+           (metadata->header_size == expected.header_size) &&
+           (metadata->record_size == expected.record_size) &&
+           (metadata->semantics == expected.semantics) &&
+           (metadata->check == logger_metadata_check(metadata));
+}
+
+static HAL_StatusTypeDef logger_write_metadata(void)
+{
+    LoggerMetadata_t metadata = logger_expected_metadata();
+
+    return flash_write(EXT_FLASH_METADATA_ADDRESS,
+                       (const uint8_t *)&metadata,
+                       sizeof(metadata));
 }
 
 static uint32_t logger_get_record_address(uint32_t record_index)
@@ -65,6 +127,7 @@ static uint32_t logger_get_record_address(uint32_t record_index)
 
 HAL_StatusTypeDef logger_init(void)
 {
+    LoggerMetadata_t metadata;
     FlightLogRecord_t record;
     uint32_t address;
 
@@ -83,7 +146,53 @@ HAL_StatusTypeDef logger_init(void)
         return HAL_ERROR;
     }
 
-    printf("[LOGGER] Scanning existing records...\r\n");
+    if (flash_read(EXT_FLASH_METADATA_ADDRESS,
+                   (uint8_t *)&metadata,
+                   sizeof(metadata)) != HAL_OK)
+    {
+        printf("[LOGGER] Failed to read format metadata.\r\n");
+        return HAL_ERROR;
+    }
+
+    if (logger_bytes_are_erased(&metadata, sizeof(metadata)))
+    {
+        /*
+         * A blank metadata sector is safe only when the first log slot is
+         * also blank. Nonblank data here is a legacy/unversioned log and must
+         * never be decoded using the new calibration units and semantics.
+         */
+        if (flash_read(LOGGER_REGION_START,
+                       (uint8_t *)&record,
+                       sizeof(record)) != HAL_OK)
+        {
+            printf("[LOGGER] Failed to inspect the first log record.\r\n");
+            return HAL_ERROR;
+        }
+
+        if (!logger_bytes_are_erased(&record, sizeof(record)))
+        {
+            printf("[LOGGER] Legacy/unversioned records detected.\r\n");
+            printf("[LOGGER] Use 'log_clear' to initialize format v%u.\r\n",
+                   (unsigned int)LOGGER_FORMAT_VERSION);
+            return HAL_ERROR;
+        }
+
+        if (logger_write_metadata() != HAL_OK)
+        {
+            printf("[LOGGER] Failed to create format metadata.\r\n");
+            return HAL_ERROR;
+        }
+    }
+    else if (!logger_metadata_is_valid(&metadata))
+    {
+        printf("[LOGGER] Incompatible or corrupt log format metadata.\r\n");
+        printf("[LOGGER] Use 'log_clear' to initialize format v%u.\r\n",
+               (unsigned int)LOGGER_FORMAT_VERSION);
+        return HAL_ERROR;
+    }
+
+    printf("[LOGGER] Scanning format v%u records...\r\n",
+           (unsigned int)LOGGER_FORMAT_VERSION);
 
     for (uint32_t index = 0U;
          index < LOGGER_MAX_RECORDS;
@@ -106,7 +215,7 @@ HAL_StatusTypeDef logger_init(void)
             return HAL_ERROR;
         }
 
-        if (logger_record_is_erased(&record))
+        if (logger_bytes_are_erased(&record, sizeof(record)))
         {
             logger_record_count = index;
             logger_write_address = address;
@@ -322,10 +431,23 @@ HAL_StatusTypeDef logger_erase(void)
     }
 
     logger_active = false;
+    logger_initialized = false;
+
+    if (flash_erase_4k(EXT_FLASH_METADATA_ADDRESS) != HAL_OK)
+    {
+        printf("[LOGGER] Failed to erase logger metadata.\r\n");
+        return HAL_ERROR;
+    }
 
     if (flash_erase_4k(LOGGER_REGION_START) != HAL_OK)
     {
         printf("[LOGGER] Failed to erase logger region.\r\n");
+        return HAL_ERROR;
+    }
+
+    if (logger_write_metadata() != HAL_OK)
+    {
+        printf("[LOGGER] Failed to write logger format metadata.\r\n");
         return HAL_ERROR;
     }
 
@@ -348,30 +470,40 @@ uint32_t logger_get_capacity(void)
     return LOGGER_MAX_RECORDS;
 }
 
+uint16_t logger_get_format_version(void)
+{
+    return LOGGER_FORMAT_VERSION;
+}
+
 void flash_logger_init(void) {
 	if (flash_init() != HAL_OK)
 	{
 	  printf("[MAIN] Flash initialization failed.\r\n");
+	  logger_available = false;
+	  return;
 	}
-	else
+
+	flash_available = true;
+	printf("[MAIN] External flash is ready.\r\n");
+
+	if (logger_init() != HAL_OK)
 	{
-	  flash_available = true;
-	  printf("[MAIN] External flash is ready.\r\n");
+	  printf("[MAIN] Logger initialization failed; attempting recovery.\r\n");
 
-	  if (logger_init() != HAL_OK)
+	  if (logger_erase() != HAL_OK)
 	  {
-		  printf("[MAIN] Logger initialization failed.\r\n");
-	  }
-	  else
-	  {
-		  logger_available = true;
-
-		  printf(
-			  "[MAIN] Logger ready with %lu existing records.\r\n",
-			  (unsigned long)logger_get_record_count()
-		  );
+		  printf("[MAIN] Logger recovery failed.\r\n");
+		  logger_available = false;
+		  return;
 	  }
 	}
+
+	logger_available = true;
+
+	printf(
+		  "[MAIN] Logger ready with %lu existing records.\r\n",
+		  (unsigned long)logger_get_record_count()
+	);
 }
 
 HAL_StatusTypeDef logger_start(void)

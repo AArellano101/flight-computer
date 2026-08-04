@@ -1,10 +1,7 @@
 /*
  * ms5611.h
  * Driver for MS5611 pressure and temperature sensor (I2C, STM32 HAL)
- * Author: Jakub Zakrzewski
- * Date:   30.08.2025
  */
-
 
 #ifndef PERIPHERALS_MS5611_H
 #define PERIPHERALS_MS5611_H
@@ -15,39 +12,63 @@ extern "C" {
 
 #include "stm32h7xx_hal.h"
 
-/** @brief 7-bit I2C address of MS5611 from datasheet */
-#define MS5611_I2C_ADDR       0x76
-/** @brief 8-bit I2C address for HAL functions */
-#define MS5611_I2C_ADDR_HAL   (MS5611_I2C_ADDR << 1)
+/** @brief 7-bit I2C address (0x76 when CSB is high; use 0x77 when low). */
+#define MS5611_I2C_ADDR       0x76U
+/** @brief Address format expected by the STM32 HAL I2C functions. */
+#define MS5611_I2C_ADDR_HAL   (MS5611_I2C_ADDR << 1U)
 
-/* MS5611 commands */
-#define MS5611_CMD_RESET        0x1E  /**< Reset command */
-#define MS5611_CMD_CONV_D1      0x40  /**< Base command for pressure conversion */
-#define MS5611_CMD_CONV_D2      0x50  /**< Base command for temperature conversion */
-#define MS5611_CMD_ADC_READ     0x00  /**< Read ADC result */
-#define MS5611_CMD_READ_PROM    0xA0  /**< Base command for PROM read */
+/* MS5611 commands. */
+#define MS5611_CMD_RESET        0x1EU
+#define MS5611_CMD_CONV_D1      0x40U
+#define MS5611_CMD_CONV_D2      0x50U
+#define MS5611_CMD_ADC_READ     0x00U
+#define MS5611_CMD_READ_PROM    0xA0U
 
-/* Oversampling Ratio (OSR) settings */
-#define MS5611_OSR_256          0x00  /**< OSR = 256  (0.60 ms conversion time) */
-#define MS5611_OSR_512          0x02  /**< OSR = 512  (1.17 ms conversion time) */
-#define MS5611_OSR_1024         0x04  /**< OSR = 1024 (2.28 ms conversion time) */
-#define MS5611_OSR_2048         0x06  /**< OSR = 2048 (4.54 ms conversion time) */
-#define MS5611_OSR_4096         0x08  /**< OSR = 4096 (9.04 ms conversion time) */
+/* Oversampling-ratio command suffixes. */
+#define MS5611_OSR_256          0x00U
+#define MS5611_OSR_512          0x02U
+#define MS5611_OSR_1024         0x04U
+#define MS5611_OSR_2048         0x06U
+#define MS5611_OSR_4096         0x08U
+
+/** A complete, compensated pressure/temperature sample. */
+typedef struct {
+    uint32_t timestamp_ms;
+    uint32_t sequence;
+    float temperature_c;
+    float pressure_pa;
+} MS5611_Sample_t;
+
+/** Result of advancing the non-blocking conversion state machine. */
+typedef enum {
+    MS5611_POLL_NO_DATA = 0,
+    MS5611_POLL_NEW_DATA,
+    MS5611_POLL_ERROR
+} MS5611_PollStatus_t;
 
 /**
- * @brief Initialize the MS5611 sensor and read calibration data.
- * @param hi2c Pointer to HAL I2C handle.
- * @param mathMode 0 = default constants, 1 = application note constants.
+ * @brief Reset the sensor, load all PROM words, and validate PROM CRC4.
+ *
+ * The first D1 conversion is started by MS5611_Poll().
+ *
+ * @param hi2c Pointer to the I2C peripheral used by this sensor.
+ * @return HAL_OK when the sensor is ready, the HAL error from a failed bus
+ *         transaction, or HAL_ERROR for invalid coefficients/CRC.
  */
-void MS5611_Init(I2C_HandleTypeDef *hi2c, uint8_t mathMode);
+HAL_StatusTypeDef MS5611_Init(I2C_HandleTypeDef *hi2c);
 
 /**
- * @brief Trigger a measurement and read temperature & pressure.
- * @param hi2c Pointer to HAL I2C handle.
- * @param temperature Pointer to store temperature in °C.
- * @param pressure Pointer to store pressure in Pa.
+ * @brief Advance the D1/D2 conversion state machine without delaying.
+ *
+ * Call this regularly. The output object is modified only when
+ * MS5611_POLL_NEW_DATA is returned. A bus/ADC/compensation error discards the
+ * incomplete pair, leaves @p sample unchanged, and restarts at a fresh D1.
+ *
+ * @param hi2c I2C handle previously passed to MS5611_Init().
+ * @param sample Destination for a newly completed sample.
  */
-void MS5611_Measure(I2C_HandleTypeDef *hi2c, float *temperature, float *pressure);
+MS5611_PollStatus_t MS5611_Poll(I2C_HandleTypeDef *hi2c,
+                                MS5611_Sample_t *sample);
 
 #ifdef __cplusplus
 }

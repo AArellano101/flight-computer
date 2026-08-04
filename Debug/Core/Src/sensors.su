@@ -1,3 +1,9 @@
-../Core/Src/sensors.c:7:6:imu_is_healthy	4	static
-../Core/Src/sensors.c:12:6:barometer_is_healthy	4	static
-../Core/Src/sensors.c:17:6:magnetometer_is_healthy	4	static
+../Core/Src/sensors.c:11:13:sensor_id_is_valid	16	static
+../Core/Src/sensors.c:16:6:sensor_health_set_initialized	16	static
+../Core/Src/sensors.c:29:6:sensor_health_record_success	16	static
+../Core/Src/sensors.c:41:6:sensor_health_record_failure	16	static
+../Core/Src/sensors.c:54:16:sensor_health_get	40	static
+../Core/Src/sensors.c:66:6:sensor_is_healthy	32	static
+../Core/Src/sensors.c:88:6:imu_is_healthy	8	static
+../Core/Src/sensors.c:93:6:barometer_is_healthy	8	static
+../Core/Src/sensors.c:98:6:magnetometer_is_healthy	8	static

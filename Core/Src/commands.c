@@ -5,6 +5,8 @@
 #include "ms5611.h"
 #include "flash.h"
 #include "logger.h"
+#include "ground_calibration.h"
+#include "flight_app.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -30,9 +32,11 @@ static uint32_t saved_reset_causes = 0; // Stores interpreted causes
 static uint32_t saved_rcc_rsr = 0; // Stores raw register value
 
 extern RTC_HandleTypeDef hrtc; // Contains info like RTC peripherals, prescalar settings, hour format, etc.
-extern I2C_HandleTypeDef hi2c2;
-extern float temperature_c;
-extern float pressure_hpa;
+static const char *command_calibration_state_name(
+    GroundCalibrationState_t state);
+static const char *command_calibration_failure_name(
+    GroundCalibrationFailure_t failure);
+static bool command_calibration_is_busy(void);
 
 
 void command_process(const char *command)
@@ -58,10 +62,30 @@ void command_process(const char *command)
         command_reset_cause();
     }
     else if (strcmp(command, "imu") == 0) {
-    	lsm6dso32x_read_data();
+		command_imu_readout();
     }
     else if (strcmp(command, "baro") == 0) {
-    	baro_read();
+		command_baro_readout();
+    }
+    else if (strcmp(command, "calibrate_ground") == 0)
+    {
+        command_calibrate_ground();
+    }
+    else if (strcmp(command, "ground_confirm") == 0)
+    {
+        command_ground_confirm();
+    }
+    else if (strcmp(command, "flight_lock") == 0)
+    {
+        command_flight_lock();
+    }
+    else if (strcmp(command, "cal_status") == 0)
+    {
+        command_calibration_status();
+    }
+    else if (strcmp(command, "cal_abort") == 0)
+    {
+        command_calibration_abort();
     }
     else if ((strncmp(command, "flash_read", 10U) == 0) &&
         ((command[10] == '\0') || (command[10] == ' ')))
@@ -110,6 +134,11 @@ void command_help(void)
     printf("-----------------------------\r\n");
     printf("imu                          Show data from IMU\r\n");
     printf("baro                         Show data from barometer\r\n");
+    printf("ground_confirm               Confirm safe ground mode and calibrate\r\n");
+    printf("flight_lock                  Persistently inhibit recalibration\r\n");
+    printf("calibrate_ground             Restart ground calibration\r\n");
+    printf("cal_status                   Show ground calibration status\r\n");
+    printf("cal_abort                    Abort ground calibration\r\n");
 
     printf("\r\n");
     printf("Flash and Logger Commands\r\n");
@@ -140,11 +169,20 @@ void command_status(void)
 
     uint32_t system_clock_hz = HAL_RCC_GetSysClockFreq();
     uint32_t system_clock_mhz = system_clock_hz / 1000000U;
+    GroundCalibrationState_t calibration_state =
+        ground_calibration_get_state();
 
     printf("\r\n");
     printf("Mini Flight Computer Status\r\n");
     printf("---------------------------\r\n");
-    printf("System:           RUNNING\r\n");
+    printf("System:           %s\r\n",
+           command_calibration_state_name(calibration_state));
+    printf("Calibration:      %s (%lu%%)\r\n",
+           ground_calibration_is_ready() ? "VALID" : "NOT READY",
+           (unsigned long)(ground_calibration_get_progress() * 100.0f));
+    printf("Ground mode:      %s\r\n",
+           flight_is_ground_mode_confirmed() ?
+               "CONFIRMED" : "LOCKED/UNKNOWN");
     printf("MCU:              STM32H743\r\n");
     printf("Firmware:         v%s\r\n", FIRMWARE_VERSION);
     printf("System clock:     %lu MHz\r\n",
@@ -194,30 +232,38 @@ void command_sensor_status(void)
     bool magnetometer_ok = magnetometer_is_healthy();
 
     uint8_t healthy_count = 0U;
+    uint8_t required_healthy_count = 0U;
 
     healthy_count += imu_ok ? 1U : 0U;
     healthy_count += barometer_ok ? 1U : 0U;
     healthy_count += magnetometer_ok ? 1U : 0U;
+    required_healthy_count += imu_ok ? 1U : 0U;
+    required_healthy_count += barometer_ok ? 1U : 0U;
 
     printf("\r\n");
     printf("Sensor Status\r\n");
     printf("---------------------------\r\n");
 
+    printf("IMU:              %s\r\n",
+           imu_ok ? "OK" : "ERROR/STALE");
+
     printf("Barometer:        %s\r\n",
-           barometer_ok ? "OK" : "ERROR");
+           barometer_ok ? "OK" : "ERROR/STALE");
 
     printf("Magnetometer:     %s\r\n",
-           magnetometer_ok ? "OK" : "ERROR");
+           magnetometer_ok ? "OK" : "DISABLED/ERROR");
 
     printf("---------------------------\r\n");
-    printf("Healthy sensors:  %u / 4\r\n",
+    printf("Healthy sensors:  %u / 3\r\n",
            (unsigned int)healthy_count);
+    printf("Required sensors: %u / 2\r\n",
+           (unsigned int)required_healthy_count);
 
-    if (healthy_count == 4U)
+    if (required_healthy_count == 2U)
     {
         printf("Overall status:   OK\r\n");
     }
-    else if (healthy_count > 0U)
+    else if (required_healthy_count > 0U)
     {
         printf("Overall status:   DEGRADED\r\n");
     }
@@ -435,9 +481,212 @@ void command_reset_cause(void)
            (unsigned long)saved_rcc_rsr);
 }
 
-void baro_read(void) {
-	 MS5611_Measure(&hi2c2, &temperature_c, &pressure_hpa);
-	 //printf("Temp: %.2f C | Press: %.2f hPa\r\n", temperature_c, pressure_hpa);
+static const char *command_calibration_state_name(
+    GroundCalibrationState_t state)
+{
+    switch (state)
+    {
+        case GROUND_CALIBRATION_UNINITIALIZED:
+            return "UNINITIALIZED";
+        case GROUND_CALIBRATION_WARMUP:
+            return "GROUND WARMUP";
+        case GROUND_CALIBRATION_CALIBRATING:
+            return "GROUND CALIBRATING";
+        case GROUND_CALIBRATION_READY:
+            return "GROUND READY";
+        case GROUND_CALIBRATION_ABORTED:
+            return "CALIBRATION ABORTED";
+        case GROUND_CALIBRATION_FAULT:
+            return "FAULT";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+static const char *command_calibration_failure_name(
+    GroundCalibrationFailure_t failure)
+{
+    switch (failure)
+    {
+        case GROUND_CALIBRATION_FAILURE_NONE:
+            return "none";
+        case GROUND_CALIBRATION_FAILURE_MOTION:
+            return "motion detected";
+        case GROUND_CALIBRATION_FAILURE_IMU_ERROR:
+            return "IMU error";
+        case GROUND_CALIBRATION_FAILURE_BARO_ERROR:
+            return "barometer error";
+        case GROUND_CALIBRATION_FAILURE_NOISY:
+            return "sample window too noisy";
+        case GROUND_CALIBRATION_FAILURE_TIMEOUT:
+            return "timeout";
+        case GROUND_CALIBRATION_FAILURE_ABORTED:
+            return "aborted";
+        default:
+            return "unknown";
+    }
+}
+
+static bool command_calibration_is_busy(void)
+{
+    GroundCalibrationState_t state = ground_calibration_get_state();
+
+    return (state == GROUND_CALIBRATION_WARMUP) ||
+           (state == GROUND_CALIBRATION_CALIBRATING);
+}
+
+void command_imu_readout(void)
+{
+    ImuSample_t sample;
+    float corrected_gyro_dps[3];
+
+    if (!flight_get_latest_imu_sample(&sample))
+    {
+        printf("No valid IMU sample is available.\r\n");
+        return;
+    }
+
+    ground_calibration_correct_gyro(
+        sample.angular_rate_dps,
+        corrected_gyro_dps);
+
+    printf("IMU sample %lu | age %lu ms | fresh mask 0x%02X\r\n",
+           (unsigned long)sample.sequence,
+           (unsigned long)(HAL_GetTick() - sample.timestamp_ms),
+           sample.fresh_mask);
+    printf("  Accel [mg]: X=%8.2f Y=%8.2f Z=%8.2f\r\n",
+           (double)sample.acceleration_mg[0],
+           (double)sample.acceleration_mg[1],
+           (double)sample.acceleration_mg[2]);
+    printf("  Gyro raw [dps]: X=%8.3f Y=%8.3f Z=%8.3f\r\n",
+           (double)sample.angular_rate_dps[0],
+           (double)sample.angular_rate_dps[1],
+           (double)sample.angular_rate_dps[2]);
+    printf("  Gyro calibrated [dps]: X=%8.3f Y=%8.3f Z=%8.3f\r\n",
+           (double)corrected_gyro_dps[0],
+           (double)corrected_gyro_dps[1],
+           (double)corrected_gyro_dps[2]);
+}
+
+void command_baro_readout(void)
+{
+    MS5611_Sample_t sample;
+    float altitude_agl_m;
+
+    if (!flight_get_latest_baro_sample(&sample))
+    {
+        printf("No valid barometer sample is available.\r\n");
+        return;
+    }
+
+    printf("Barometer sample %lu | age %lu ms\r\n",
+           (unsigned long)sample.sequence,
+           (unsigned long)(HAL_GetTick() - sample.timestamp_ms));
+    printf("  Pressure: %.2f Pa (%.2f hPa)\r\n",
+           (double)sample.pressure_pa,
+           (double)(sample.pressure_pa / 100.0f));
+    printf("  Temperature: %.2f C\r\n", (double)sample.temperature_c);
+
+    if (flight_get_latest_altitude_agl_m(&altitude_agl_m))
+    {
+        printf("  Altitude AGL: %.2f m\r\n", (double)altitude_agl_m);
+    }
+    else
+    {
+        printf("  Altitude AGL: invalid until ground calibration completes\r\n");
+    }
+}
+
+void command_calibrate_ground(void)
+{
+    if (logger_is_active())
+    {
+        printf("Stop logging before restarting ground calibration.\r\n");
+        return;
+    }
+
+    if (!flight_is_ground_mode_confirmed())
+    {
+        printf("Calibration is locked for flight/unknown mode.\r\n");
+        printf("When safely stationary on the ground, use 'ground_confirm'.\r\n");
+        return;
+    }
+
+    if (!flight_request_ground_calibration_restart())
+    {
+        printf("Ground calibration restart was rejected.\r\n");
+        return;
+    }
+
+    printf("Ground calibration restart requested. Keep vehicle still.\r\n");
+}
+
+void command_ground_confirm(void)
+{
+    if (logger_is_active())
+    {
+        printf("Stop logging before confirming ground mode.\r\n");
+        return;
+    }
+
+    flight_confirm_ground_mode();
+    printf("Ground mode confirmed and calibration requested.\r\n");
+    printf("Keep the vehicle stationary until calibration is READY.\r\n");
+}
+
+void command_flight_lock(void)
+{
+    flight_lock_ground_calibration();
+    printf("Flight lock set; ground recalibration is inhibited across resets.\r\n");
+}
+
+void command_calibration_abort(void)
+{
+    if (!command_calibration_is_busy())
+    {
+        printf("Ground calibration is not active.\r\n");
+        return;
+    }
+
+    flight_request_ground_calibration_abort();
+    printf("Ground calibration abort requested.\r\n");
+}
+
+void command_calibration_status(void)
+{
+    GroundCalibrationState_t state = ground_calibration_get_state();
+    GroundCalibrationFailure_t failure = ground_calibration_get_failure();
+    const GroundCalibrationResult_t *result = ground_calibration_get_result();
+
+    printf("\r\nGround Calibration\r\n");
+    printf("---------------------------\r\n");
+    printf("State:       %s\r\n", command_calibration_state_name(state));
+    printf("Ground mode: %s\r\n",
+           flight_is_ground_mode_confirmed() ?
+               "CONFIRMED" : "LOCKED/UNKNOWN");
+    printf("Progress:    %lu%%\r\n",
+           (unsigned long)(ground_calibration_get_progress() * 100.0f));
+    printf("Last reason: %s\r\n",
+           command_calibration_failure_name(failure));
+
+    if ((result != NULL) && result->valid)
+    {
+        printf("Gyro bias [dps]: X=%.4f Y=%.4f Z=%.4f\r\n",
+               (double)result->gyro_bias_dps[0],
+               (double)result->gyro_bias_dps[1],
+               (double)result->gyro_bias_dps[2]);
+        printf("Gravity reference [mg]: X=%.2f Y=%.2f Z=%.2f\r\n",
+               (double)result->gravity_reference_mg[0],
+               (double)result->gravity_reference_mg[1],
+               (double)result->gravity_reference_mg[2]);
+        printf("Ground pressure: %.2f Pa\r\n",
+               (double)result->ground_pressure_pa);
+        printf("Pressure sigma: %.2f Pa\r\n",
+               (double)result->pressure_stddev_pa);
+        printf("Samples: IMU=%lu Baro=%lu\r\n",
+               (unsigned long)result->imu_sample_count,
+               (unsigned long)result->baro_sample_count);
+    }
 }
 
 static bool command_parse_u32(
@@ -477,6 +726,12 @@ void command_flash_read(const char *arguments)
     uint32_t offset = 0U;
     uint32_t chunk_length;
     uint8_t buffer[16];
+
+    if (command_calibration_is_busy())
+    {
+        printf("Flash reads are disabled during ground calibration.\r\n");
+        return;
+    }
 
     if (!flash_available || !flash_is_ready())
     {
@@ -555,7 +810,27 @@ void command_log_start(void)
         return;
     }
 
-    (void)logger_start();
+    if (!ground_calibration_is_ready())
+    {
+        printf("Logging requires a valid ground calibration.\r\n");
+        return;
+    }
+
+    if (!imu_is_healthy() || !barometer_is_healthy())
+    {
+        printf("Logging requires healthy, fresh IMU and barometer data.\r\n");
+        return;
+    }
+
+    /* Persist the flight lock before the session can begin. */
+    flight_lock_ground_calibration();
+
+    if (logger_start() != HAL_OK)
+    {
+        printf("Logger start failed.\r\n");
+        printf("Ground calibration remains locked; use 'ground_confirm' "
+               "only when safely on the ground.\r\n");
+    }
 }
 
 void command_log_stop(void)
@@ -566,14 +841,23 @@ void command_log_stop(void)
         return;
     }
 
-    (void)logger_stop();
+    if (logger_stop() != HAL_OK)
+    {
+        printf("Logger stop failed.\r\n");
+    }
 }
 
 void command_log_clear(void)
 {
-    if (!logger_available)
+    if (!flash_available || !flash_is_ready())
     {
-        printf("Logger is not available.\r\n");
+        printf("External flash is not available.\r\n");
+        return;
+    }
+
+    if (command_calibration_is_busy())
+    {
+        printf("Log erase is disabled during ground calibration.\r\n");
         return;
     }
 
@@ -591,6 +875,9 @@ void command_log_clear(void)
         return;
     }
 
+    /* Also recovers a logger disabled by legacy/corrupt format metadata. */
+    logger_available = true;
+
     printf("Logged records cleared.\r\n");
 }
 
@@ -601,6 +888,12 @@ void command_log_dump(const char *arguments)
     uint32_t requested_count = 10U;
     uint32_t stored_count;
     uint32_t dump_count;
+
+    if (command_calibration_is_busy())
+    {
+        printf("Log dump is disabled during ground calibration.\r\n");
+        return;
+    }
 
     if (!logger_available)
     {
@@ -663,6 +956,8 @@ void command_log_dump(const char *arguments)
            (unsigned long)stored_count);
     printf("Records shown:  %lu\r\n",
            (unsigned long)dump_count);
+    printf("Log format:     v%u\r\n",
+           (unsigned int)logger_get_format_version());
     printf("========================================\r\n");
 
     for (uint32_t index = 0U;
@@ -680,20 +975,23 @@ void command_log_dump(const char *arguments)
         }
 
         printf(
-            "Record %lu | Time: %.3f s\r\n",
+            "Record %lu | IMU time: %.3f s | Baro time: %.3f s | "
+            "valid=0x%08lX\r\n",
             (unsigned long)index,
-            (double)record.timestamp_ms / 1000.0
+            (double)record.timestamp_ms / 1000.0,
+            (double)record.barometer_timestamp_ms / 1000.0,
+            (unsigned long)record.validity_flags
         );
 
         printf(
-            "  Accel: X=%8.2f  Y=%8.2f  Z=%8.2f\r\n",
+            "  Accel [mg]: X=%8.2f  Y=%8.2f  Z=%8.2f\r\n",
             (double)record.acceleration_x,
             (double)record.acceleration_y,
             (double)record.acceleration_z
         );
 
         printf(
-            "  Gyro:  X=%8.2f  Y=%8.2f  Z=%8.2f\r\n",
+            "  Gyro [dps]: X=%8.2f  Y=%8.2f  Z=%8.2f\r\n",
             (double)record.angular_rate_x,
             (double)record.angular_rate_y,
             (double)record.angular_rate_z
@@ -705,7 +1003,7 @@ void command_log_dump(const char *arguments)
         );
 
         printf(
-            "          Temperature=%6.2f C  Altitude=%7.2f m\r\n",
+            "          Temperature=%6.2f C  Altitude AGL=%7.2f m\r\n",
             (double)record.temperature_c,
             (double)record.altitude_m
         );

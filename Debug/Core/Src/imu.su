@@ -1,4 +1,6 @@
-../Core/Src/imu.c:18:9:platform_write	48	static
-../Core/Src/imu.c:28:9:platform_read	48	static
-../Core/Src/imu.c:38:6:lsm6dso32x_init	16	static
-../Core/Src/imu.c:77:6:lsm6dso32x_read_data	32	static
+../Core/Src/imu.c:23:16:platform_write	48	static
+../Core/Src/imu.c:38:16:platform_read	48	static
+../Core/Src/imu.c:53:19:lsm6dso32x_init	16	static
+../Core/Src/imu.c:130:17:lsm6dso32x_poll	80	static
+../Core/Src/imu.c:213:6:imu_transform_sensor_to_body	64	static
+../Core/Src/imu.c:249:6:lsm6dso32x_read_data	48	static
